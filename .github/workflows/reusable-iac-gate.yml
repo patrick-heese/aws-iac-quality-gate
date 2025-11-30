@@ -1,0 +1,348 @@
+name: reusable-iac-gate
+
+on:
+  workflow_call:
+    inputs:
+      iac_tool:
+        description: "terraform | cloudformation | sam"
+        required: true
+        type: string
+      working_directory:
+        description: "Path to IaC"
+        required: false
+        default: "."
+        type: string
+      aws_region:
+        required: false
+        default: "us-east-1"
+        type: string
+      aws_role_arn:
+        description: "OIDC role to assume (needed for CFN/SAM and TF with AWS data sources)"
+        required: false
+        type: string
+      apply:
+        description: "Set true to deploy (guarded by environment approvals)"
+        required: false
+        default: false
+        type: boolean
+      environment:
+        description: "Environment name for approvals (used only if you set apply: true)"
+        required: false
+        default: "prod"
+        type: string
+      terraform_version:
+        required: false
+        default: "1.14.0"
+        type: string
+      tf_backend_bucket:
+        description: "S3 bucket for Terraform backend"
+        required: false
+        default: ""
+        type: string
+      tf_backend_key:
+        description: "Object key for Terraform state"
+        required: false
+        default: ""
+        type: string
+      tf_backend_use_lockfile:
+        description: "Use S3 native lock file (.tflock)"
+        required: false
+        default: false
+        type: boolean
+      tf_workspace:
+        description: "Terraform workspace name (optional)"
+        required: false
+        default: ""
+        type: string
+      cfn_template:
+        description: "CFN/SAM template path"
+        required: false
+        default: "template.yaml"
+        type: string
+      cfn_stack_name:
+        description: "CloudFormation/SAM stack name"
+        required: false
+        type: string
+      cfn_capabilities:
+        required: false
+        default: "CAPABILITY_NAMED_IAM"
+        type: string
+      cfn_parameter_overrides:
+        description: "Space-separated KEY=VALUE pairs"
+        required: false
+        type: string
+      sam_config:
+        description: "samconfig.toml path if used"
+        required: false
+        default: "samconfig.toml"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: iac-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: ${{ format('IaC Gate • {0} • apply={1}', inputs.iac_tool, inputs.apply) }}
+    runs-on: ubuntu-latest
+
+    env:
+      CHANGE_SET_NAME: ""
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ inputs.aws_role_arn != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # ---------- CFN/SAM Python toolchain ----------
+      - name: Setup Python
+        if: ${{ inputs.iac_tool != 'terraform' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install cfn-lint
+        if: ${{ inputs.iac_tool != 'terraform' }}
+        run: pip install cfn-lint
+
+      # ---------- Terraform ----------
+      - name: Setup Terraform
+        if: ${{ inputs.iac_tool == 'terraform' }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Install TFLint
+        if: ${{ inputs.iac_tool == 'terraform' }}
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: Terraform FMT + Validate
+        if: ${{ inputs.iac_tool == 'terraform' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset TF_PLUGIN_CACHE_DIR || true
+
+          terraform fmt -check -recursive
+
+          # Build backend args only if bucket & key are provided
+          BACKEND_ARGS=()
+          if [[ -n "${{ inputs.tf_backend_bucket }}" && -n "${{ inputs.tf_backend_key }}" ]]; then
+            BACKEND_ARGS+=(-backend-config="bucket=${{ inputs.tf_backend_bucket }}")
+            BACKEND_ARGS+=(-backend-config="key=${{ inputs.tf_backend_key }}")
+            BACKEND_ARGS+=(-backend-config="region=${{ inputs.aws_region }}")
+            # optional lock table
+            if [[ -n "${{ inputs.tf_backend_use_lockfile }}" ]]; then
+              BACKEND_ARGS+=(-backend-config="use_lockfile=${{ inputs.tf_backend_use_lockfile }}")
+            fi
+            BACKEND_ARGS+=(-backend-config="encrypt=true")
+          fi
+
+          terraform init -input=false -reconfigure "${BACKEND_ARGS[@]}"
+
+          # Optional workspace
+          if [[ -n "${{ inputs.tf_workspace }}" ]]; then
+            terraform workspace select "${{ inputs.tf_workspace }}" || terraform workspace new "${{ inputs.tf_workspace }}"
+          fi
+
+          terraform validate -no-color
+
+      - name: TFLint
+        if: ${{ inputs.iac_tool == 'terraform' }}
+        run: |
+          tflint --init
+          tflint --no-color
+
+      - name: Terraform Plan
+        if: ${{ inputs.iac_tool == 'terraform' }}
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -out=tfplan.binary
+          terraform show -json tfplan.binary > tfplan.json
+
+      - name: Upload Terraform artifacts
+        if: ${{ inputs.iac_tool == 'terraform' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: |
+            ${{ inputs.working_directory }}/tfplan.binary
+            ${{ inputs.working_directory }}/tfplan.json
+          if-no-files-found: ignore
+
+      # ---------- CloudFormation ----------
+      - name: cfn-lint
+        if: ${{ inputs.iac_tool == 'cloudformation' }}
+        run: cfn-lint "${{ inputs.cfn_template }}"
+
+      - name: Create CFN Change Set (no execute)
+        if: ${{ inputs.iac_tool == 'cloudformation' && inputs.aws_role_arn != '' && inputs.cfn_stack_name != '' }}
+        env:
+          STACK: ${{ inputs.cfn_stack_name }}
+          TEMPLATE: ${{ inputs.cfn_template }}
+          CAPS: ${{ inputs.cfn_capabilities }}
+          PARAMS: ${{ inputs.cfn_parameter_overrides }}
+        run: |
+          set -euo pipefail
+
+          # Optional: sanity check path
+          if [[ ! -f "$TEMPLATE" ]]; then
+            echo "Template not found at: $TEMPLATE"
+            ls -la .
+            exit 1
+          fi
+
+          TYPE="UPDATE"
+          if ! aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
+            TYPE="CREATE"
+          fi
+
+          CS_NAME="cs-$(date +%s)"
+
+          # Build parameter args
+          PARAM_ARGS=()
+          if [[ -n "${PARAMS:-}" ]]; then
+            if [[ "$PARAMS" == file://* ]]; then
+              # Pass file directly
+              PARAM_ARGS=(--parameters "$PARAMS")
+            else
+              # Convert "Key=Val Key2=Val2" → "ParameterKey=Key,ParameterValue=Val ..."
+              conv=$(printf '%s' "$PARAMS" \
+                | sed 's/ \+/ /g' \
+                | sed 's/\([^ =]\+\)=\([^ ]\+\)/ParameterKey=\1,ParameterValue=\2/g')
+              # shellcheck disable=SC2206
+              PARAM_ARGS=(--parameters $conv)
+            fi
+          fi
+
+          aws cloudformation create-change-set \
+            --stack-name "$STACK" \
+            --change-set-name "$CS_NAME" \
+            --change-set-type "$TYPE" \
+            --template-body "file://$TEMPLATE" \
+            --capabilities $CAPS \
+            "${PARAM_ARGS[@]}"
+
+          aws cloudformation wait change-set-create-complete --change-set-name "$CS_NAME" --stack-name "$STACK"
+          aws cloudformation describe-change-set --change-set-name "$CS_NAME" --stack-name "$STACK" > changeset.json
+          echo "CHANGE_SET_NAME=$CS_NAME" >> "$GITHUB_ENV"
+          echo "STACK_OP_TYPE=$TYPE" >> "$GITHUB_ENV"
+
+      - name: Upload CFN artifacts
+        if: ${{ inputs.iac_tool == 'cloudformation' && inputs.cfn_stack_name != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudformation-changeset
+          path: ${{ inputs.working_directory }}/changeset.json
+          if-no-files-found: ignore
+
+      # ---------- SAM ----------
+      - name: Install SAM CLI
+        if: ${{ inputs.iac_tool == 'sam' }}
+        run: pip install aws-sam-cli
+
+      - name: SAM validate (with lint)
+        if: ${{ inputs.iac_tool == 'sam' }}
+        run: |
+          sam --version
+          sam validate --lint -t "${{ inputs.cfn_template }}"
+
+      - name: SAM build (container)
+        if: ${{ inputs.iac_tool == 'sam' }}
+        run: sam build --use-container -t "${{ inputs.cfn_template }}"
+
+      - name: SAM create change set (no-execute)
+        if: ${{ inputs.iac_tool == 'sam' && inputs.aws_role_arn != '' && inputs.cfn_stack_name != '' }}
+        env:
+          STACK: ${{ inputs.cfn_stack_name }}
+          CAPS: ${{ inputs.cfn_capabilities }}
+          CONFIG: ${{ inputs.sam_config }}
+        run: |
+          set -euo pipefail
+          sam deploy \
+            --stack-name "$STACK" \
+            --no-fail-on-empty-changeset \
+            --no-confirm-changeset \
+            --no-progressbar \
+            --no-execute-changeset \
+            --capabilities $CAPS \
+            $(test -f "$CONFIG" && echo "--config-file $CONFIG")
+          CS=$(aws cloudformation list-change-sets --stack-name "$STACK" --query 'Summaries[-1].ChangeSetId' --output text || true)
+          if [[ "$CS" != "None" && -n "$CS" ]]; then
+            aws cloudformation describe-change-set --change-set-name "$CS" --stack-name "$STACK" > changeset.json
+            echo "CHANGE_SET_NAME=$CS" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload SAM artifacts
+        if: ${{ inputs.iac_tool == 'sam' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sam-artifacts
+          path: |
+            ${{ inputs.working_directory }}/.aws-sam/**
+            ${{ inputs.working_directory }}/changeset.json
+          if-no-files-found: ignore
+
+      # ---------- Apply (guarded by env approvals) ----------
+      - name: Terraform Apply
+        if: ${{ inputs.apply && inputs.iac_tool == 'terraform' }}
+        run: terraform apply -auto-approve tfplan.binary
+
+      - name: Execute CFN Change Set
+        if: ${{ inputs.apply && inputs.iac_tool == 'cloudformation' && env.CHANGE_SET_NAME != '' }}
+        env:
+          STACK: ${{ inputs.cfn_stack_name }}
+          CS: ${{ env.CHANGE_SET_NAME }}
+          OP: ${{ env.STACK_OP_TYPE }}
+        run: |
+          set -euo pipefail
+          aws cloudformation execute-change-set --change-set-name "$CS" --stack-name "$STACK"
+
+          if [[ "${OP:-}" == "CREATE" ]]; then
+            aws cloudformation wait stack-create-complete --stack-name "$STACK"
+          else
+            aws cloudformation wait stack-update-complete --stack-name "$STACK"
+          fi
+          
+          timeout=1800; interval=10; elapsed=0
+            while true; do
+              status=$(aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text || echo "UNKNOWN")
+              echo "StackStatus=$status"
+              case "$status" in
+                CREATE_COMPLETE|UPDATE_COMPLETE) break;;
+                *_FAILED|*_ROLLBACK_*|DELETE_COMPLETE|DELETE_FAILED) echo "Stack failed: $status"; exit 1;;
+              esac
+              sleep $interval
+              elapsed=$((elapsed+interval))
+              if (( elapsed >= timeout )); then echo "Timeout waiting for stack to complete"; exit 1; fi
+            done
+
+      - name: SAM Deploy (execute)
+        if: ${{ inputs.apply && inputs.iac_tool == 'sam' && inputs.cfn_stack_name != '' }}
+        env:
+          STACK: ${{ inputs.cfn_stack_name }}
+          CAPS: ${{ inputs.cfn_capabilities }}
+          CONFIG: ${{ inputs.sam_config }}
+        run: |
+          set -euo pipefail
+          sam deploy \
+            --stack-name "$STACK" \
+            --no-fail-on-empty-changeset \
+            --no-progressbar \
+            --capabilities $CAPS \
+            $(test -f "$CONFIG" && echo "--config-file $CONFIG")
