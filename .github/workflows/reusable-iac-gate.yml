@@ -92,6 +92,7 @@ jobs:
 
     env:
       CHANGE_SET_NAME: ""
+      STACK_OP_TYPE: ""
 
     defaults:
       run:
